@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import logging
-import pigpio
 import time
 
 import voluptuous as vol
 
-from homeassistant.components.cover import (
+from homeassistant.components.mqtt import valid_publish_topic
+from homeassistant.components.button import (
     PLATFORM_SCHEMA,
-    SUPPORT_CLOSE,
-    SUPPORT_OPEN,
-    SUPPORT_STOP,
-    CoverEntity,
+    ButtonEntity,
 )
 from homeassistant.components.number import RestoreNumber
 from homeassistant.const import (
     CONF_NAME,
     CONF_UNIQUE_ID,
-    CONF_COVERS,
     CONF_FRIENDLY_NAME,
     EVENT_HOMEASSISTANT_STOP,
     STATE_UNAVAILABLE,
@@ -34,27 +30,28 @@ from .encode_tables import (
 from threading import Lock
 from .const import (
     DOMAIN,
+    CONF_OMG_TOPIC,
     CONF_SERIAL,
     CONF_START_CODE,
-    CONF_GPIO,
     DEVICE_CLASS,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_GPIO = "gpio"
-CONF_SERIAL = "serial"
-CONF_PIGPIO_HOST = "pigpio_host"
-DEVICE_CLASS = "shutter"
+CONF_BUTTONS = "buttons"
+CONF_BUTTON = "button"
 
-GPIO_NONE = 0
-BUTTON_ID_OPEN = 1
-BUTTON_ID_STOP = 2
-BUTTON_ID_CLOSE = 4
+BUTTON_MAP = {
+    "TL": 1,
+    "TR": 2,
+    "BL": 4,
+    "BR": 8
+}
 
-COVER_SCHEMA = vol.Schema(
+BUTTON_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_SERIAL): cv.positive_int,
+        vol.Required(CONF_BUTTON): cv.string,
         vol.Optional(CONF_UNIQUE_ID): cv.string,
         vol.Optional(CONF_FRIENDLY_NAME): cv.string,
     }
@@ -62,10 +59,9 @@ COVER_SCHEMA = vol.Schema(
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_GPIO): cv.positive_int,
-        vol.Optional(CONF_PIGPIO_HOST, default="localhost"): cv.string,
+        vol.Required(CONF_OMG_TOPIC): valid_publish_topic,
         vol.Required(CONF_START_CODE): cv.positive_int,
-        vol.Required(CONF_COVERS): vol.Schema({cv.string: COVER_SCHEMA}),
+        vol.Required(CONF_BUTTONS): vol.Schema({cv.string: BUTTON_SCHEMA}),
     }
 )
 
@@ -83,20 +79,20 @@ def setup_platform(
 
     hub = NiceHub(
         hass=hass,
-        pigpio_host=config[CONF_PIGPIO_HOST],
-        gpio=config[CONF_GPIO],
+        omg_topic=config[CONF_OMG_TOPIC],
         next_code=next_code,
     )
     hass.data[DOMAIN] = hub
 
     devices = []
-    for dev_name, properties in config[CONF_COVERS].items():
+    for dev_name, properties in config[CONF_BUTTONS].items():
         devices.append(
-            NiceCover(
+            NiceButton(
                 hub=hub,
                 friendly_name=properties.get(CONF_FRIENDLY_NAME),
-                unique_id=properties.get(CONF_NAME, dev_name),
+                unique_id=properties.get(CONF_UNIQUE_ID, dev_name),
                 serial=properties.get(CONF_SERIAL),
+                button=properties.get(CONF_BUTTON),
             )
         )
 
@@ -110,6 +106,7 @@ def setup_platform(
         vol.Schema(
             {
                 vol.Required(CONF_SERIAL): cv.positive_int,
+                vol.Required(CONF_BUTTON): cv.string,
             }
         ),
     )
@@ -135,14 +132,14 @@ class NextCodeEntity(RestoreNumber):
                 self._attr_native_value = last_number_data.native_value
 
 
-class RFDevice:
+class PiLightDevice:
     def __init__(
         self,
-        gpio: int,
-        pi: pigpio,
+        hass,
+        topic
     ) -> None:
-        self._pi = pi
-        self._gpio = gpio
+        self.hass = hass
+        self.topic = topic
         self.tx_pulse_short = 500
         self.tx_pulse_long = 1000
         self.tx_pulse_sync = 1500
@@ -150,53 +147,32 @@ class RFDevice:
         self.tx_length = 52
 
     def tx_code(self, code: int):
-        wf = []
-        wf.extend(self.tx_sync())
+        wf = ""
+        wf += (self.tx_sync())
         rawcode = format(code, "#0{}b".format(self.tx_length))[2:]
         for bit in range(0, self.tx_length):
             if rawcode[bit] == "1":
-                wf.extend(self.tx_l0())
+                wf += (self.tx_l0())
             else:
-                wf.extend(self.tx_l1())
-        wf.extend(self.tx_sync())
-        wf.extend(self.tx_gap())
+                wf += (self.tx_l1())
+        wf += (self.tx_gap())
 
-        while self._pi.wave_tx_busy():
-            time.sleep(0.1)
+        payload = f'{{"raw": "c:{wf};p:{self.tx_pulse_short},{self.tx_pulse_long},{self.tx_pulse_sync},{self.tx_pulse_gap};r:1@"}}'
+        _LOGGER.info(f'Publishing to MQTT {self.topic}: {payload}')
 
-        self._pi.wave_clear()
-        self._pi.wave_add_generic(wf)
-        wave = self._pi.wave_create()
-        self._pi.wave_send_once(wave)
-
-        while self._pi.wave_tx_busy():
-            time.sleep(0.1)
-
-        self._pi.wave_delete(wave)
+        self.hass.components.mqtt.publish(self.hass, self.topic, payload, 0, False)
 
     def tx_l0(self):
-        return [
-            pigpio.pulse(self._gpio, GPIO_NONE, self.tx_pulse_short),
-            pigpio.pulse(GPIO_NONE, self._gpio, self.tx_pulse_long),
-        ]
+        return "01"
 
     def tx_l1(self):
-        return [
-            pigpio.pulse(self._gpio, GPIO_NONE, self.tx_pulse_long),
-            pigpio.pulse(GPIO_NONE, self._gpio, self.tx_pulse_short),
-        ]
+        return "10"
 
     def tx_sync(self):
-        return [
-            pigpio.pulse(self._gpio, GPIO_NONE, self.tx_pulse_sync),
-            pigpio.pulse(GPIO_NONE, self._gpio, self.tx_pulse_sync),
-        ]
+        return "22"
 
     def tx_gap(self):
-        return [
-            pigpio.pulse(GPIO_NONE, self._gpio, self.tx_pulse_gap),
-        ]
-
+        return "23"
 
 class PigpioNotConnected(BaseException):
     """"""
@@ -206,22 +182,16 @@ class NiceHub:
     def __init__(
         self,
         hass: HomeAssistant,
-        pigpio_host: str | None,
-        gpio: int,
+        omg_topic: str,
         next_code: NextCodeEntity,
     ) -> None:
-        self._gpio = gpio
+        self.hass = hass
+        self._omg_topic = omg_topic
         self._next_code = next_code
         self._lock = Lock()
 
-        self._pi = pigpio.pi(pigpio_host)
-        self._pi.set_mode(gpio, pigpio.OUTPUT)
-
-        if not self._pi.connected:
-            raise PigpioNotConnected()
-
-        rfdevice = RFDevice(gpio=1 << gpio, pi=self._pi)
-        self._rfdevice = rfdevice
+        pidevice = PiLightDevice(hass, omg_topic)
+        self._pidevice = pidevice
 
     def cleanup(self):
         with self._lock:
@@ -229,26 +199,27 @@ class NiceHub:
 
     def pair(self, service_call: ServiceCall):
         with self._lock:
-            button_id = BUTTON_ID_STOP
+            button_id = BUTTON_MAP[service_call.data[CONF_BUTTON]]
             code = int(self._next_code.native_value)
             serial = service_call.data[CONF_SERIAL]
 
             _LOGGER.info("Starting pairing of %s... Wait 5 seconds.", hex(serial))
 
-            for _ in range(1, 10):
-                self._send_repeated(serial, button_id, code)
+            self._send_repeated(serial, button_id, code, 1, 16)
+            for _ in range(1, 3):
+                self._send_repeated(serial, button_id, code, 0, 16)
 
             _LOGGER.info("Entered pairing mode for %s.", hex(serial))
 
     def send(self, serial: int, button_id: int):
         with self._lock:
             code = int(self._next_code.native_value)
-            self._send_repeated(serial, button_id, code)
+            self._send_repeated(serial, button_id, code, 1, 6)
             self._next_code.increase()
             time.sleep(0.5)
 
-    def _send_repeated(self, serial: int, button_id: int, code: int):
-        for repeat in range(1, 7):
+    def _send_repeated(self, serial: int, button_id: int, code: int, rep_from: int, rep_to: int):
+        for repeat in range(rep_from, rep_to):
             tx_code = self._nice_flor_s_encode(serial, code, button_id, repeat)
             _LOGGER.info(
                 "serial %s, button_id %i, code %i, tx_code %s",
@@ -257,7 +228,7 @@ class NiceHub:
                 code,
                 hex(tx_code),
             )
-            self._rfdevice.tx_code(tx_code)
+            self._pidevice.tx_code(tx_code)
 
     def _nice_flor_s_encode(
         self, serial: int, code: int, button_id: int, repeat: int
@@ -294,33 +265,23 @@ class NiceHub:
         return encoded
 
 
-class NiceCover(CoverEntity):
+class NiceButton(ButtonEntity):
     def __init__(
         self,
         hub: NiceHub,
         friendly_name: str,
         unique_id: str,
         serial: int,
+        button: str
     ):
         super().__init__()
         self._hub = hub
         self._serial = serial
+        self._button_id = BUTTON_MAP[button]
 
-        self._attr_assumed_state = True
         self._attr_name = friendly_name
         self._attr_unique_id = unique_id
-        self._attr_supported_features = SUPPORT_OPEN | SUPPORT_CLOSE | SUPPORT_STOP
-        self._attr_device_class = DEVICE_CLASS
-        self._attr_current_cover_position = 50
-        self._attr_is_closed = False
-        self._attr_is_opening = False
-        self._attr_should_poll = False
 
-    def open_cover(self, **kwargs):
-        self._hub.send(self._serial, BUTTON_ID_OPEN)
 
-    def close_cover(self, **kwargs):
-        self._hub.send(self._serial, BUTTON_ID_CLOSE)
-
-    def stop_cover(self, **kwargs) -> None:
-        self._hub.send(self._serial, BUTTON_ID_STOP)
+    def press(self, **kwargs):
+        self._hub.send(self._serial, self._button_id)
